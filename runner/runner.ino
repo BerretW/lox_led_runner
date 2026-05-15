@@ -8,6 +8,7 @@
 // ========== HARDWARE NASTAVENÍ ============
 // ==========================================
 #define MAX_STRIPS 4
+#define CONFIG_VERSION 3
 // Piny pro pásky. Na NodeMCU/Wemos to je: 5(D1), 4(D2), 14(D5), 12(D6)
 const int STRIP_PINS[MAX_STRIPS] = {0, 2, 4, 5}; 
 
@@ -16,13 +17,15 @@ const int STRIP_PINS[MAX_STRIPS] = {0, 2, 4, 5};
 // ==========================================
 struct Config {
   char magic[4];
+  uint16_t version;
   char ssid[32];
   char password[64];
   char moduleName[32];
   int numStrips;
   int numPixels[MAX_STRIPS];
   int fillSpeedMs[MAX_STRIPS];
-  bool reverseOff;
+  uint8_t maxBrightness;
+  uint16_t checksum;
 };
 
 Config config;
@@ -32,7 +35,7 @@ DNSServer dnsServer;
 bool apMode = false;           
 const byte DNS_PORT = 53;
 
-enum StripState { STATE_OFF, STATE_FILLING, STATE_ON, STATE_UNFILLING };
+enum StripState { STATE_OFF, STATE_FILLING, STATE_ON };
 
 // ==========================================
 // ====== TŘÍDA PRO JEDEN NEOPIXEL PÁSEK ====
@@ -47,8 +50,9 @@ struct NeoStrip {
   int lastLitPixel = -1;
   
   int fillSpeedMs = 30;
-  bool reverseOff = false;
-  int colorRed = 150, colorGreen = 150, colorBlue = 150;
+  uint8_t maxBrightness = 255;
+  uint8_t colorLevel = 255;
+  unsigned long lastShowMillis = 0;
 
   void init(int p, int count) {
     pin = p;
@@ -63,6 +67,16 @@ struct NeoStrip {
     }
   }
 
+  uint8_t scaleLevel(uint8_t level) const {
+    return (uint8_t)(((uint16_t)level * (uint16_t)maxBrightness) / 255U);
+  }
+
+  uint32_t whiteColor(uint8_t level) const {
+    if (pixels == nullptr) return 0;
+    uint8_t scaled = scaleLevel(level);
+    return pixels->Color(scaled, scaled, scaled);
+  }
+
   void turnOn() {
     if (numPixels <= 0 || pixels == nullptr) return;
     state = STATE_FILLING;
@@ -74,84 +88,55 @@ struct NeoStrip {
 
   void turnOff() {
     if (numPixels <= 0 || pixels == nullptr) return;
-    if (reverseOff && state == STATE_ON) {
-      state = STATE_UNFILLING;
-      fillStartMillis = millis();
-      lastLitPixel = 0;
-    } else {
-      state = STATE_OFF;
-      pixels->clear();
-      pixels->show();
-    }
+    state = STATE_OFF;
+    pixels->clear();
+    pixels->show();
   }
 
   void update() {
     if (numPixels <= 0 || pixels == nullptr) return;
 
+    unsigned long now = millis();
+
     if (state == STATE_FILLING) {
-      unsigned long elapsed = millis() - fillStartMillis;
+      unsigned long elapsed = now - fillStartMillis;
       unsigned long totalTime = (unsigned long)numPixels * fillSpeedMs;
 
       if (elapsed >= totalTime) {
         for (int i = 0; i < numPixels; i++)
-          pixels->setPixelColor(i, pixels->Color(colorRed, colorGreen, colorBlue));
+          pixels->setPixelColor(i, whiteColor(colorLevel));
+        yield();
         pixels->show();
+        lastShowMillis = now;
         state = STATE_ON;
       } else {
+        if (now - lastShowMillis < 20) return;
+
         float progress = (float)elapsed / fillSpeedMs;
         int currentPix = (int)progress;
         float fraction = progress - currentPix;
 
-        if (lastLitPixel != -1 && currentPix > lastLitPixel) {
-          for (int i = lastLitPixel; i < currentPix; i++)
-            if (i < numPixels)
-              pixels->setPixelColor(i, pixels->Color(colorRed, colorGreen, colorBlue));
-        }
-        lastLitPixel = currentPix;
+        if (currentPix < 0) currentPix = 0;
+        if (currentPix > numPixels) currentPix = numPixels;
 
-        if (currentPix < numPixels) {
-          pixels->setPixelColor(currentPix, pixels->Color(
-            (int)(colorRed * fraction),
-            (int)(colorGreen * fraction),
-            (int)(colorBlue * fraction)
-          ));
-        }
-        pixels->show();
-      }
-    }
+        int partialIdx = currentPix;
+        uint32_t fullColor = whiteColor(colorLevel);
+        uint8_t partialLevel = (uint8_t)(colorLevel * fraction);
 
-    else if (state == STATE_UNFILLING) {
-      unsigned long elapsed = millis() - fillStartMillis;
-      unsigned long totalTime = (unsigned long)numPixels * fillSpeedMs;
-
-      if (elapsed >= totalTime) {
-        pixels->clear();
-        pixels->show();
-        state = STATE_OFF;
-      } else {
-        float progress = (float)elapsed / fillSpeedMs;
-        int currentOff = (int)progress;
-        float fraction = 1.0f - (progress - currentOff);
-
-        // turn off newly completed pixels (from end)
-        if (currentOff > lastLitPixel) {
-          for (int i = lastLitPixel; i < currentOff; i++) {
-            int idx = numPixels - 1 - i;
-            if (idx >= 0) pixels->setPixelColor(idx, 0);
+        for (int i = 0; i < numPixels; i++) {
+          if (i < partialIdx) {
+            pixels->setPixelColor(i, fullColor);
+          } else if (i == partialIdx && partialIdx < numPixels) {
+            pixels->setPixelColor(i, whiteColor(partialLevel));
+          } else {
+            pixels->setPixelColor(i, 0);
           }
-          lastLitPixel = currentOff;
         }
 
-        // dim the pixel currently transitioning
-        int idx = numPixels - 1 - currentOff;
-        if (idx >= 0) {
-          pixels->setPixelColor(idx, pixels->Color(
-            (int)(colorRed * fraction),
-            (int)(colorGreen * fraction),
-            (int)(colorBlue * fraction)
-          ));
-        }
+        lastLitPixel = currentPix;
+        yield();
         pixels->show();
+        lastShowMillis = now;
       }
     }
   }
@@ -159,17 +144,122 @@ struct NeoStrip {
 
 NeoStrip strips[MAX_STRIPS];
 
-void loadConfig() { EEPROM.get(0, config); }
-void saveConfig() { EEPROM.put(0, config); EEPROM.commit(); }
-void resetConfig() { memset(config.magic, 0, sizeof(config.magic)); saveConfig(); }
+uint16_t calculateConfigChecksum(const Config& value) {
+  const uint8_t* data = reinterpret_cast<const uint8_t*>(&value);
+  const size_t length = offsetof(Config, checksum);
+  uint16_t checksum = 0xA5A5;
+
+  for (size_t i = 0; i < length; i++) {
+    checksum = (uint16_t)((checksum << 5) | (checksum >> 11));
+    checksum ^= data[i];
+  }
+
+  return checksum;
+}
+
+void applyDefaultConfig(Config& value) {
+  memset(&value, 0, sizeof(value));
+  strncpy(value.magic, "CFG", sizeof(value.magic));
+  value.version = CONFIG_VERSION;
+  strncpy(value.moduleName, "ESP8266_Modul", sizeof(value.moduleName) - 1);
+  value.numStrips = 1;
+  value.numPixels[0] = 60;
+  for (int i = 0; i < MAX_STRIPS; i++) {
+    value.fillSpeedMs[i] = 30;
+  }
+  value.maxBrightness = 255;
+}
+
+bool sanitizeConfig(Config& value) {
+  bool changed = false;
+
+  if (strncmp(value.magic, "CFG", sizeof(value.magic)) != 0) {
+    strncpy(value.magic, "CFG", sizeof(value.magic));
+    changed = true;
+  }
+  if (value.version != CONFIG_VERSION) {
+    value.version = CONFIG_VERSION;
+    changed = true;
+  }
+
+  value.ssid[sizeof(value.ssid) - 1] = '\0';
+  value.password[sizeof(value.password) - 1] = '\0';
+  value.moduleName[sizeof(value.moduleName) - 1] = '\0';
+
+  if (strlen(value.moduleName) == 0) {
+    strncpy(value.moduleName, "ESP8266_Modul", sizeof(value.moduleName) - 1);
+    changed = true;
+  }
+  if (value.numStrips < 1 || value.numStrips > MAX_STRIPS) {
+    value.numStrips = 1;
+    changed = true;
+  }
+  if (value.maxBrightness < 1 || value.maxBrightness > 255) {
+    value.maxBrightness = 255;
+    changed = true;
+  }
+
+  for (int i = 0; i < MAX_STRIPS; i++) {
+    int clampedPixels = value.numPixels[i];
+    int clampedSpeed = value.fillSpeedMs[i];
+
+    if (clampedPixels < 0) clampedPixels = 0;
+    if (clampedPixels > 1000) clampedPixels = 1000;
+    if (clampedSpeed < 1) clampedSpeed = 30;
+    if (clampedSpeed > 500) clampedSpeed = 500;
+
+    if (value.numPixels[i] != clampedPixels) {
+      value.numPixels[i] = clampedPixels;
+      changed = true;
+    }
+    if (value.fillSpeedMs[i] != clampedSpeed) {
+      value.fillSpeedMs[i] = clampedSpeed;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+bool isConfigValid(const Config& value) {
+  if (strncmp(value.magic, "CFG", sizeof(value.magic)) != 0) return false;
+  if (value.version != CONFIG_VERSION) return false;
+  return value.checksum == calculateConfigChecksum(value);
+}
+
+bool loadConfig() {
+  EEPROM.get(0, config);
+
+  if (!isConfigValid(config)) {
+    applyDefaultConfig(config);
+    return false;
+  }
+
+  return true;
+}
+
+void saveConfig() {
+  sanitizeConfig(config);
+  config.checksum = calculateConfigChecksum(config);
+  EEPROM.put(0, config);
+  EEPROM.commit();
+}
+
+void resetConfig() {
+  Config emptyConfig = {};
+  EEPROM.put(0, emptyConfig);
+  EEPROM.commit();
+}
 
 // WiFi scan se provede jednou při startu a výsledek se cachuje.
 // Opakované skenování uvnitř HTTP handleru by blokovalo smyčku a mohlo crashnout WDT.
 String cachedWifiOptions;
+int cachedWifiCount = 0;
 
 void buildWifiOptions() {
   int n = WiFi.scanNetworks();
   cachedWifiOptions = "";
+  cachedWifiCount = (n > 0) ? n : 0;
   if (n > 0) {
     cachedWifiOptions.reserve(n * 72);
     for (int i = 0; i < n; i++) {
@@ -266,14 +356,29 @@ String getSetupPage() {
         <input type="text" name="moduleName" maxlength="31" value=")rawliteral" + String(config.moduleName) + R"rawliteral(">
 
         <label>WiFi SSID:</label>
-        <input type="text" name="ssid" list="wifi-list" maxlength="31" value=")rawliteral" + String(config.ssid) + R"rawliteral(">
-        <datalist id="wifi-list">)rawliteral" + cachedWifiOptions + R"rawliteral(</datalist>
+        )rawliteral";
+
+  if (cachedWifiOptions.length() > 0) {
+    html += "<select style='width:100%;padding:10px;margin-top:5px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;background:#fff;font-size:15px;' "
+            "onchange=\"if(this.value){document.querySelector('[name=ssid]').value=this.value;} this.selectedIndex=0;\">"
+            "<option value=''>-- Vybrat ze seznamu (" + String(cachedWifiCount) + " siti) --</option>";
+    html += cachedWifiOptions;
+    html += "</select>";
+  } else {
+    html += "<p style='color:#999;font-size:13px;margin:4px 0 6px;'>Zadna sit nenalezena (restartujte pro obnovu seznamu)</p>";
+  }
+
+  html += R"rawliteral(
+        <input type="text" name="ssid" maxlength="31" placeholder="SSID sit" value=")rawliteral" + String(config.ssid) + R"rawliteral(">
         
         <label>WiFi Heslo:</label>
         <input type="password" name="pass" maxlength="63" placeholder="(Beze změny nechte prázdné)">
         
         <label>Počet aktivních LED pásků (1-4):</label>
         <input type="number" name="numStrips" min="1" max="4" value=")rawliteral" + String(config.numStrips) + R"rawliteral(">
+
+          <label>Maximální jas (1-255):<span class='note'>255 = plný jas, nižší hodnota omezí svit všech pásků.</span></label>
+          <input type="number" name="maxBrightness" min="1" max="255" value=")rawliteral" + String(config.maxBrightness) + R"rawliteral(">
   )rawliteral";
 
   for (int i = 0; i < MAX_STRIPS; i++) {
@@ -283,14 +388,7 @@ String getSetupPage() {
     html += "<input type='number' name='spd" + String(i) + "' min='1' max='500' value='" + String(config.fillSpeedMs[i] > 0 ? config.fillSpeedMs[i] : 30) + "'>";
   }
 
-  String revChecked = config.reverseOff ? " checked" : "";
   html += R"rawliteral(
-        <div style='margin-top:20px; padding:12px; background:#f0f4ff; border-radius:6px; display:flex; align-items:center; gap:12px;'>
-          <input type='checkbox' name='reverseOff' id='revOff' value='1')rawliteral" + revChecked + R"rawliteral( style='width:20px;height:20px;cursor:pointer;'>
-          <label for='revOff' style='margin:0; font-weight:bold; cursor:pointer;'>Zpětny chod pri shasnutí
-            <span class='note'>LED pásky zhasínají animovaně od konce.</span>
-          </label>
-        </div>
         <input type="submit" class="btn btn-save" value="Uložit a Restartovat">
       </form>
 
@@ -324,30 +422,132 @@ String getSetupPage() {
 }
 
 // ==========================================
+// =========== SÉRIOVÉ PŘÍKAZY ==============
+// ==========================================
+String serialBuf;
+
+void printSerialHelp() {
+  Serial.println(F("Prikazy (115200 baud, LF nebo CR+LF):"));
+  Serial.println(F("  on [1-4]   zapnout pasek (bez cisla = vse)"));
+  Serial.println(F("  off [1-4]  vypnout pasek (bez cisla = vse)"));
+  Serial.println(F("  status     stav vsech pasku"));
+  Serial.println(F("  info       konfigurace a sit"));
+  Serial.println(F("  restart    restart ESP"));
+  Serial.println(F("  reset      smazat EEPROM a restart"));
+}
+
+void processSerialCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  int spaceIdx = cmd.indexOf(' ');
+  String verb = (spaceIdx >= 0) ? cmd.substring(0, spaceIdx) : cmd;
+  String arg  = (spaceIdx >= 0) ? cmd.substring(spaceIdx + 1) : String("");
+  arg.trim();
+  verb.toLowerCase();
+
+  if (verb == "help") {
+    printSerialHelp();
+
+  } else if (verb == "on" || verb == "off") {
+    bool turningOn = (verb == "on");
+    int id = arg.length() > 0 ? arg.toInt() : 0;
+    int count = min(config.numStrips, (int)MAX_STRIPS);
+
+    if (id > 0 && id <= MAX_STRIPS) {
+      turningOn ? strips[id - 1].turnOn() : strips[id - 1].turnOff();
+      Serial.print(F("Pasek ")); Serial.print(id);
+      Serial.println(turningOn ? F(": ON") : F(": OFF"));
+    } else if (id == 0) {
+      for (int i = 0; i < count; i++)
+        turningOn ? strips[i].turnOn() : strips[i].turnOff();
+      Serial.println(turningOn ? F("Vsechny pasky: ON") : F("Vsechny pasky: OFF"));
+    } else {
+      Serial.println(F("Chyba: ID pasku 1-4"));
+    }
+
+  } else if (verb == "status") {
+    int count = min(config.numStrips, (int)MAX_STRIPS);
+    for (int i = 0; i < count; i++) {
+      Serial.print(F("Pasek ")); Serial.print(i + 1); Serial.print(F(": "));
+      switch (strips[i].state) {
+        case STATE_OFF:       Serial.println(F("OFF")); break;
+        case STATE_ON:        Serial.println(F("ON")); break;
+        case STATE_FILLING:   Serial.println(F("Rozsviuji...")); break;
+      }
+    }
+
+  } else if (verb == "info") {
+    Serial.println(F("=== Konfigurace ==="));
+    Serial.print(F("Modul: "));    Serial.println(config.moduleName);
+    Serial.print(F("SSID: "));     Serial.println(config.ssid);
+    Serial.print(F("Rezim: "));    Serial.println(apMode ? F("AP") : F("STA"));
+    Serial.print(F("IP: "));       Serial.println(apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString());
+    Serial.print(F("Pasky: "));    Serial.println(config.numStrips);
+    for (int i = 0; i < min(config.numStrips, (int)MAX_STRIPS); i++) {
+      Serial.print(F("  Pasek ")); Serial.print(i + 1);
+      Serial.print(F(": "));       Serial.print(config.numPixels[i]);
+      Serial.print(F(" LED, "));   Serial.print(config.fillSpeedMs[i]);
+      Serial.println(F(" ms/LED"));
+    }
+    Serial.print(F("Max jas: "));     Serial.println(config.maxBrightness);
+    Serial.print(F("Volna heap: ")); Serial.print(ESP.getFreeHeap()); Serial.println(F(" B"));
+
+  } else if (verb == "restart") {
+    Serial.println(F("Restartuji..."));
+    delay(200);
+    ESP.restart();
+
+  } else if (verb == "reset") {
+    Serial.println(F("Mazu EEPROM a restartuji..."));
+    resetConfig();
+    delay(200);
+    ESP.restart();
+
+  } else {
+    Serial.print(F("Neznamy prikaz: ")); Serial.println(cmd);
+    Serial.println(F("Napiste 'help'"));
+  }
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBuf.length() > 0) {
+        processSerialCommand(serialBuf);
+        serialBuf = "";
+      }
+    } else if (serialBuf.length() < 64) {
+      serialBuf += c;
+    }
+  }
+}
+
+// ==========================================
 // ============== SETUP & LOOP ==============
 // ==========================================
 void setup() {
   Serial.begin(115200);
-  EEPROM.begin(512); 
+  EEPROM.begin(512);
   delay(500);
+  Serial.println(F("\n=== LED Runner ==="));
+  printSerialHelp();
 
-  loadConfig();
-  bool validConfig = (strcmp(config.magic, "CFG") == 0);
-
-  if (!validConfig || strlen(config.moduleName) == 0) strncpy(config.moduleName, "ESP8266_Modul", 32);
-  if (!validConfig || config.numStrips < 1 || config.numStrips > MAX_STRIPS) config.numStrips = 1;
+  bool validConfig = loadConfig();
+  bool configChanged = sanitizeConfig(config);
+  if (!validConfig || configChanged) saveConfig();
   
   WiFi.hostname(config.moduleName);
   
   for (int i = 0; i < MAX_STRIPS; i++) {
-    if (!validConfig) config.numPixels[i] = (i == 0) ? 60 : 0;
-    if (config.fillSpeedMs[i] <= 0) config.fillSpeedMs[i] = 30;
+    strips[i].maxBrightness = config.maxBrightness;
     strips[i].init(STRIP_PINS[i], config.numPixels[i]);
     strips[i].fillSpeedMs = config.fillSpeedMs[i];
-    strips[i].reverseOff = config.reverseOff;
   }
 
   WiFi.mode(WIFI_STA);
+  delay(150);
   buildWifiOptions();
 
   if (validConfig && strlen(config.ssid) > 0) {
@@ -386,7 +586,10 @@ void setup() {
       int ns = server.arg("numStrips").toInt();
       config.numStrips = (ns < 1) ? 1 : (ns > MAX_STRIPS) ? MAX_STRIPS : ns;
     }
-    config.reverseOff = server.hasArg("reverseOff");
+    if (server.hasArg("maxBrightness")) {
+      int brightness = server.arg("maxBrightness").toInt();
+      config.maxBrightness = (brightness < 1) ? 1 : (brightness > 255) ? 255 : brightness;
+    }
     for (int i = 0; i < MAX_STRIPS; i++) {
       String ledArg = "led" + String(i);
       if (server.hasArg(ledArg)) {
@@ -430,6 +633,7 @@ void setup() {
 }
 
 void loop() {
+  handleSerial();
   if (apMode) dnsServer.processNextRequest();
   server.handleClient();
   for (int i = 0; i < MAX_STRIPS; i++) strips[i].update();
