@@ -8,7 +8,7 @@
 // ========== HARDWARE NASTAVENÍ ============
 // ==========================================
 #define MAX_STRIPS 4
-#define CONFIG_VERSION 3
+#define CONFIG_VERSION 4
 // Piny pro pásky. Na NodeMCU/Wemos to je: 5(D1), 4(D2), 14(D5), 12(D6)
 const int STRIP_PINS[MAX_STRIPS] = {0, 2, 4, 5}; 
 
@@ -21,6 +21,11 @@ struct Config {
   char ssid[32];
   char password[64];
   char moduleName[32];
+  bool useDhcp;
+  char staticIp[16];
+  char gateway[16];
+  char subnet[16];
+  char dns1[16];
   int numStrips;
   int numPixels[MAX_STRIPS];
   int fillSpeedMs[MAX_STRIPS];
@@ -162,12 +167,22 @@ void applyDefaultConfig(Config& value) {
   strncpy(value.magic, "CFG", sizeof(value.magic));
   value.version = CONFIG_VERSION;
   strncpy(value.moduleName, "ESP8266_Modul", sizeof(value.moduleName) - 1);
+  value.useDhcp = true;
+  strncpy(value.staticIp, "192.168.1.50", sizeof(value.staticIp) - 1);
+  strncpy(value.gateway, "192.168.1.1", sizeof(value.gateway) - 1);
+  strncpy(value.subnet, "255.255.255.0", sizeof(value.subnet) - 1);
+  strncpy(value.dns1, "192.168.1.1", sizeof(value.dns1) - 1);
   value.numStrips = 1;
   value.numPixels[0] = 60;
   for (int i = 0; i < MAX_STRIPS; i++) {
     value.fillSpeedMs[i] = 30;
   }
   value.maxBrightness = 255;
+}
+
+bool isValidIpString(const char* value) {
+  IPAddress ip;
+  return ip.fromString(value);
 }
 
 bool sanitizeConfig(Config& value) {
@@ -185,10 +200,36 @@ bool sanitizeConfig(Config& value) {
   value.ssid[sizeof(value.ssid) - 1] = '\0';
   value.password[sizeof(value.password) - 1] = '\0';
   value.moduleName[sizeof(value.moduleName) - 1] = '\0';
+  value.staticIp[sizeof(value.staticIp) - 1] = '\0';
+  value.gateway[sizeof(value.gateway) - 1] = '\0';
+  value.subnet[sizeof(value.subnet) - 1] = '\0';
+  value.dns1[sizeof(value.dns1) - 1] = '\0';
 
   if (strlen(value.moduleName) == 0) {
     strncpy(value.moduleName, "ESP8266_Modul", sizeof(value.moduleName) - 1);
     changed = true;
+  }
+  if (!value.useDhcp) {
+    if (!isValidIpString(value.staticIp)) {
+      strncpy(value.staticIp, "192.168.1.50", sizeof(value.staticIp) - 1);
+      value.staticIp[sizeof(value.staticIp) - 1] = '\0';
+      changed = true;
+    }
+    if (!isValidIpString(value.gateway)) {
+      strncpy(value.gateway, "192.168.1.1", sizeof(value.gateway) - 1);
+      value.gateway[sizeof(value.gateway) - 1] = '\0';
+      changed = true;
+    }
+    if (!isValidIpString(value.subnet)) {
+      strncpy(value.subnet, "255.255.255.0", sizeof(value.subnet) - 1);
+      value.subnet[sizeof(value.subnet) - 1] = '\0';
+      changed = true;
+    }
+    if (!isValidIpString(value.dns1)) {
+      strncpy(value.dns1, "192.168.1.1", sizeof(value.dns1) - 1);
+      value.dns1[sizeof(value.dns1) - 1] = '\0';
+      changed = true;
+    }
   }
   if (value.numStrips < 1 || value.numStrips > MAX_STRIPS) {
     value.numStrips = 1;
@@ -275,6 +316,24 @@ void buildWifiOptions() {
   WiFi.scanDelete();
 }
 
+bool applyWifiNetworkConfig() {
+  if (config.useDhcp) {
+    return WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
+  }
+
+  IPAddress localIp;
+  IPAddress gatewayIp;
+  IPAddress subnetMask;
+  IPAddress dnsServerIp;
+
+  if (!localIp.fromString(config.staticIp)) return false;
+  if (!gatewayIp.fromString(config.gateway)) return false;
+  if (!subnetMask.fromString(config.subnet)) return false;
+  if (!dnsServerIp.fromString(config.dns1)) return false;
+
+  return WiFi.config(localIp, gatewayIp, subnetMask, dnsServerIp);
+}
+
 // ==========================================
 // ======== HTML STRÁNKA NASTAVENÍ ==========
 // ==========================================
@@ -345,6 +404,15 @@ String getSetupPage() {
           .catch(function() { showToast('Chyba spojení!', false); })
           .finally(function() { if (btn) { btn.disabled = false; btn.textContent = orig; } });
       }
+
+      function toggleStaticIpFields() {
+        var useDhcp = document.getElementById('useDhcp');
+        var staticWrap = document.getElementById('static-ip-fields');
+        if (!useDhcp || !staticWrap) return;
+        staticWrap.style.display = useDhcp.checked ? 'none' : 'block';
+      }
+
+      window.addEventListener('load', toggleStaticIpFields);
     </script>
   </head>
   <body>
@@ -373,6 +441,28 @@ String getSetupPage() {
         
         <label>WiFi Heslo:</label>
         <input type="password" name="pass" maxlength="63" placeholder="(Beze změny nechte prázdné)">
+
+        <div style='margin-top:18px; padding:12px; background:#f7f7f7; border-radius:6px;'>
+          <label for='useDhcp' style='margin:0; cursor:pointer;'>
+            <input type='checkbox' id='useDhcp' name='useDhcp' value='1' onchange='toggleStaticIpFields()')rawliteral" + String(config.useDhcp ? " checked" : "") + R"rawliteral( style='width:18px;height:18px;vertical-align:middle;margin-right:8px;'>
+            Získat IP adresu z DHCP
+          </label>
+          <span class='note'>Pokud checkbox vypnete, modul použije pevnou IP adresu.</span>
+        </div>
+
+        <div id='static-ip-fields' style='margin-top:12px;'>
+          <label>Pevná IP adresa:</label>
+          <input type="text" name="staticIp" maxlength="15" placeholder="192.168.1.50" value=")rawliteral" + String(config.staticIp) + R"rawliteral(">
+
+          <label>Brána:</label>
+          <input type="text" name="gateway" maxlength="15" placeholder="192.168.1.1" value=")rawliteral" + String(config.gateway) + R"rawliteral(">
+
+          <label>Maska sítě:</label>
+          <input type="text" name="subnet" maxlength="15" placeholder="255.255.255.0" value=")rawliteral" + String(config.subnet) + R"rawliteral(">
+
+          <label>DNS server:</label>
+          <input type="text" name="dns1" maxlength="15" placeholder="192.168.1.1" value=")rawliteral" + String(config.dns1) + R"rawliteral(">
+        </div>
         
         <label>Počet aktivních LED pásků (1-4):</label>
         <input type="number" name="numStrips" min="1" max="4" value=")rawliteral" + String(config.numStrips) + R"rawliteral(">
@@ -482,6 +572,13 @@ void processSerialCommand(String cmd) {
     Serial.print(F("Modul: "));    Serial.println(config.moduleName);
     Serial.print(F("SSID: "));     Serial.println(config.ssid);
     Serial.print(F("Rezim: "));    Serial.println(apMode ? F("AP") : F("STA"));
+    Serial.print(F("Sit: "));      Serial.println(config.useDhcp ? F("DHCP") : F("Pevna IP"));
+    if (!config.useDhcp) {
+      Serial.print(F("Static IP: ")); Serial.println(config.staticIp);
+      Serial.print(F("Brana: "));     Serial.println(config.gateway);
+      Serial.print(F("Maska: "));     Serial.println(config.subnet);
+      Serial.print(F("DNS: "));       Serial.println(config.dns1);
+    }
     Serial.print(F("IP: "));       Serial.println(apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString());
     Serial.print(F("Pasky: "));    Serial.println(config.numStrips);
     for (int i = 0; i < min(config.numStrips, (int)MAX_STRIPS); i++) {
@@ -547,6 +644,7 @@ void setup() {
   }
 
   WiFi.mode(WIFI_STA);
+  applyWifiNetworkConfig();
   delay(150);
   buildWifiOptions();
 
@@ -581,6 +679,23 @@ void setup() {
     if (server.hasArg("pass") && server.arg("pass").length() > 0) {
       strncpy(config.password, server.arg("pass").c_str(), sizeof(config.password) - 1);
       config.password[sizeof(config.password) - 1] = '\0';
+    }
+    config.useDhcp = server.hasArg("useDhcp");
+    if (server.hasArg("staticIp")) {
+      strncpy(config.staticIp, server.arg("staticIp").c_str(), sizeof(config.staticIp) - 1);
+      config.staticIp[sizeof(config.staticIp) - 1] = '\0';
+    }
+    if (server.hasArg("gateway")) {
+      strncpy(config.gateway, server.arg("gateway").c_str(), sizeof(config.gateway) - 1);
+      config.gateway[sizeof(config.gateway) - 1] = '\0';
+    }
+    if (server.hasArg("subnet")) {
+      strncpy(config.subnet, server.arg("subnet").c_str(), sizeof(config.subnet) - 1);
+      config.subnet[sizeof(config.subnet) - 1] = '\0';
+    }
+    if (server.hasArg("dns1")) {
+      strncpy(config.dns1, server.arg("dns1").c_str(), sizeof(config.dns1) - 1);
+      config.dns1[sizeof(config.dns1) - 1] = '\0';
     }
     if (server.hasArg("numStrips")) {
       int ns = server.arg("numStrips").toInt();
